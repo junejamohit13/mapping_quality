@@ -5,7 +5,7 @@ from pyspark.sql.functions import col, expr, when
 import pandas as pd
 import networkx as nx
 from itertools import permutations
-
+import openpyxl
 # COMMAND ----------
 # Helper functions
 
@@ -19,32 +19,38 @@ def read_mapping_files(file_path):
     pivot_mapping = pd.read_excel(xls, 'Pivot Operations')
     sort_order = pd.read_excel(xls, 'Sort Order')
     return column_mapping, relationships, table_filters, unpivot_mapping, pivot_mapping, sort_order
+def get_table_filter(table_filters, target_table, source_table):
+    matching_filters = table_filters[
+        (table_filters['target_table'] == target_table) & 
+        (table_filters['source_table'] == source_table)
+    ]
+    
+    if not matching_filters.empty:
+        return matching_filters['filter_condition'].iloc[0]
+    else:
+        return "1=1"  # Default to no filter if no matching condition is found
 
 def find_optimal_join_order(relationships, source_tables):
-    """Find the optimal join order for the given tables."""
     G = nx.Graph()
+    
     for _, row in relationships.iterrows():
         if row['table_left'] in source_tables and row['table_right'] in source_tables:
             G.add_edge(row['table_left'], row['table_right'])
     
+    print("Graph edges:", G.edges())
+    print("Is connected:", nx.is_connected(G))
+    
     if not nx.is_connected(G):
         return None, None  # Indicate that a complete join is not possible
     
-    for start, end in permutations(source_tables, 2):
-        try:
-            path = nx.shortest_path(G, start, end)
-            if set(path) == set(source_tables):
-                join_order = list(zip(path[:-1], path[1:]))
-                return path[0], join_order
-        except nx.NetworkXNoPath:
-            continue
+    # Find the table with the most connections (likely to be the central table)
+    central_table = max(G.degree, key=lambda x: x[1])[0]
     
-    return None, None  # If no valid path is found
-
-# COMMAND ----------
-# Main ETL function
-
-def perform_etl(spark, column_mapping, relationships, table_filters, unpivot_mapping, pivot_mapping, sort_order):
+    # Use BFS to get a join order starting from the central table
+    join_order = list(nx.bfs_edges(G, central_table))
+    
+    return central_table, join_order
+def perform_etl(column_mapping, relationships, table_filters, unpivot_mapping, pivot_mapping):
     target_tables = column_mapping['target_table'].unique()
     
     for target_table in target_tables:
@@ -53,42 +59,65 @@ def perform_etl(spark, column_mapping, relationships, table_filters, unpivot_map
         pivot_ops = pivot_mapping[pivot_mapping['target_table'].str.startswith(target_table.split('_')[0])]
         
         source_tables = set(col.split('.')[0] for col in mappings['source_columns'].str.split(',').explode() if col != '*')
+        
         primary_table, join_order = find_optimal_join_order(relationships, source_tables)
         
         if primary_table is None:
             return f"Not possible: The source tables for {target_table} are not fully connected."
         
-        # Generate initial DataFrames for each source table
-        table_dfs = {}
-        for source_table in source_tables:
-            table_columns = [col for col in mappings['source_columns'].str.split(',').explode() if col.startswith(f"{source_table}.")]
-            unique_columns = list(dict.fromkeys(table_columns))
-            column_exprs = [expr(f"{col}").alias(col.replace('.', '_')) for col in unique_columns]
-            
-            table_filter = table_filters[
-                (table_filters['target_table'] == target_table) & 
-                (table_filters['source_table'] == source_table)
-            ]['filter_condition'].iloc[0] if not table_filters.empty else "1=1"
-            
-            df = spark.table(source_table).select(*column_exprs).filter(table_filter)
-            table_dfs[source_table] = df
+        cte_expressions = []
+        unpivot_ctes = []
         
-        # Apply unpivot operations
-        for _, unpivot_op in unpivot_ops.iterrows():
-            value_column_groups = unpivot_op['value_columns'].split(';')
-            metric_column = unpivot_op['metric_column']
-            category_columns = unpivot_op['category_columns'].split(',')
-            metric_values = unpivot_op['metric_values'].split(';')
+        # Generate initial CTEs for each source table
+        for source_table in source_tables:
+            if source_table in unpivot_ops['target_table'].values:
+                # This is an unpivoted table, so we need to generate its CTE differently
+                unpivot_op = unpivot_ops[unpivot_ops['target_table'] == source_table].iloc[0]
+                value_column_groups = unpivot_op['value_columns'].split(';')
+                metric_column = unpivot_op['metric_column']
+                category_columns = unpivot_op['category_columns'].split(',')
+                metric_values = unpivot_op['metric_values'].split(';')
 
-            stack_expr = "stack({}, {}) as ({}, {})".format(
-                len(metric_values),
-                ", ".join(f"'{metric}', {columns}" for metric, columns in zip(metric_values, value_column_groups)),
-                metric_column,
-                ", ".join(category_columns)
-            )
+                stack_args = []
+                for metric, columns in zip(metric_values, value_column_groups):
+                    stack_args.extend([f"'{metric}'"] + columns.split(','))
 
-            df = table_dfs[unpivot_op['source_table']].select("*", expr(stack_expr))
-            table_dfs[unpivot_op['target_table']] = df
+                unpivot_cte = f"""
+                {source_table} AS (
+                    SELECT 
+                        id,
+                        date,
+                        {metric_column},
+                        {', '.join(category_columns)}
+                    FROM (
+                        SELECT 
+                            id,
+                            date,
+                            stack({len(metric_values)}, {', '.join(stack_args)}) AS ({metric_column}, {', '.join(category_columns)})
+                        FROM {unpivot_op['source_table']}
+                    )
+                )
+                """
+                unpivot_ctes.append(unpivot_cte)
+            else:
+                # This is a regular source table
+                table_columns = [col for col in mappings['source_columns'].str.split(',').explode() if col.startswith(f"{source_table}.")]
+                unique_columns = list(dict.fromkeys(table_columns))
+                column_exprs = [f"{col} as {col.replace('.', '_')}" for col in unique_columns]
+                
+                table_filter = get_table_filter(table_filters, target_table, source_table)
+                
+                cte_expr = f"""
+                {source_table}_cte AS (
+                    SELECT {', '.join(column_exprs)}
+                    FROM {source_table}
+                    WHERE {table_filter}
+                )
+                """
+                cte_expressions.append(cte_expr)
+        
+        # Add unpivot CTEs after regular CTEs
+        cte_expressions.extend(unpivot_ctes)
         
         # Apply pivot operations
         for _, pivot_op in pivot_ops.iterrows():
@@ -97,67 +126,75 @@ def perform_etl(spark, column_mapping, relationships, table_filters, unpivot_map
             category_columns = pivot_op['category_columns'].split(',')
             pivot_values = pivot_op['pivot_values'].split(',')
 
-            pivot_expr = [when(col(pivot_column) == value, col(value_column)).alias(f"{value}_{category}") 
-                          for value in pivot_values 
-                          for category in category_columns]
-
-            df = table_dfs[pivot_op['source_table']].groupBy("id", "date").agg(*pivot_expr)
-            table_dfs[pivot_op['target_table']] = df
+            pivot_expr = f"""
+            {pivot_op['target_table']} AS (
+                SELECT 
+                    id,
+                    date,
+                    {', '.join(f"MAX(CASE WHEN {pivot_column} = '{pivot_value}' THEN {value_column} END) AS {pivot_value}_{category}" for pivot_value in pivot_values for category in category_columns)}
+                FROM {pivot_op['source_table']}
+                GROUP BY id, date
+            )
+            """
+            cte_expressions.append(pivot_expr)
         
-        # Perform the joins
-        joined_df = table_dfs[primary_table]
+        # Generate the joined CTE
+        join_conditions = []
+        joined_tables = {primary_table}
         for left_table, right_table in join_order:
-            if right_table not in table_dfs:
-                continue
-            rel = relationships[(relationships['table_left'] == left_table) & 
-                                (relationships['table_right'] == right_table) |
-                                (relationships['table_left'] == right_table) & 
-                                (relationships['table_right'] == left_table)].iloc[0]
-            
-            join_condition = rel['join_condition'].replace('.', '_')
-            join_type = rel['join_type'].lower()
-            
-            joined_df = joined_df.join(table_dfs[right_table], on=expr(join_condition), how=join_type)
+            if right_table not in joined_tables:
+                rel = relationships[(relationships['table_left'] == left_table) & 
+                                    (relationships['table_right'] == right_table) |
+                                    (relationships['table_left'] == right_table) & 
+                                    (relationships['table_right'] == left_table)].iloc[0]
+                
+                join_condition = rel['join_condition']
+                join_type = rel['join_type'].upper()
+                
+                right_table_alias = f"{right_table}_cte" if right_table not in unpivot_ops['target_table'].values else right_table
+                
+                join_expr = f"""
+                {join_type} JOIN {right_table_alias}
+                ON {join_condition}
+                """
+                join_conditions.append(join_expr)
+                joined_tables.add(right_table)
         
-        # Select final columns
-        final_columns = [expr(col).alias(target_col) for col, target_col in zip(mappings['source_columns'], mappings['target_column_name'])]
-        result_df = joined_df.select(*final_columns)
+        joined_cte = f"""
+        {target_table}_joined AS (
+            SELECT {', '.join(mappings['target_column_name'])}
+            FROM {primary_table}_cte
+            {' '.join(join_conditions)}
+        )
+        """
+        cte_expressions.append(joined_cte)
         
-        # Apply sorting
-        table_sort_order = sort_order[sort_order['target_table'] == target_table]['sort_columns'].iloc[0]
-        if table_sort_order:
-            sort_columns = table_sort_order.split(',')
-            result_df = result_df.orderBy(*sort_columns)
         
-        # Show the result
-        result_df.show()
+        # Construct the final SQL query
+        cte_sql = "WITH " + ",\n".join(cte_expressions)
+        final_sql = f"""
+        {cte_sql}
+        SELECT {', '.join(mappings['target_column_name'])}
+        FROM {target_table}_joined
+        WHERE {' OR '.join(f'{col} IS NOT NULL' for col in mappings['target_column_name'] if col not in ['id', 'date'])}
+        """
         
-        # Optionally, you can write the result to a table or file
-        # result_df.write.mode("overwrite").saveAsTable(f"{target_table}_result")
         
-        return result_df
+        return final_sql
 
-# COMMAND ----------
-# Main execution block
+def get_table_filter(table_filters, target_table, source_table):
+    matching_filters = table_filters[
+        (table_filters['target_table'] == target_table) & 
+        (table_filters['source_table'] == source_table)
+    ]
+    
+    if not matching_filters.empty:
+        return matching_filters['filter_condition'].iloc[0]
+    else:
+        return "1=1"  # Default to no filter if no matching condition is found
 
-# Initialize Spark session (this is usually not needed in Databricks as it's automatically available)
-spark = SparkSession.builder.appName("ETL_Job").getOrCreate()
-
-# Specify the path to your mapping file
-mapping_file_path = "/dbfs/FileStore/shared_uploads/your_mapping_file.xlsx"
-
-# Read mapping files
+# Example usage
+mapping_file_path = "/Workspace/Users/mohitjuneja1983@gmail.com/etl_mapping.xlsx"
 column_mapping, relationships, table_filters, unpivot_mapping, pivot_mapping, sort_order = read_mapping_files(mapping_file_path)
-
-# Perform ETL
-result = perform_etl(spark, column_mapping, relationships, table_filters, unpivot_mapping, pivot_mapping, sort_order)
-
-# If result is a DataFrame, you can perform additional operations or analysis here
-if isinstance(result, pyspark.sql.DataFrame):
-    # Example: Count the number of rows
-    print(f"Number of rows in the result: {result.count()}")
-
-# COMMAND ----------
-# Display the generated SQL (optional)
-# Note: This will only show the SQL for the final query, not for intermediate operations
-print(result._jdf.queryExecution().simpleString())
+sql_result = perform_etl(column_mapping, relationships, table_filters, unpivot_mapping, pivot_mapping)
+print(sql_result)
