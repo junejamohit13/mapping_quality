@@ -250,5 +250,95 @@ def run_test():
     print("Final table state:")
     spark.table(table_name).show()
 
+
+from pyspark.sql.functions import coalesce, col, lit, when, array, expr, concat_ws
+
+def user_upsert(table_name, new_data, primary_key='id'):
+    delta_table = DeltaTable.forName(spark, table_name)
+    current_data = delta_table.toDF()
+    
+    print(f"Starting user upsert for table: {table_name}")
+    print(f"New data count: {new_data.count()}")
+    
+    # Join new data with current data
+    joined_df = new_data.alias("new").join(current_data.alias("current"), primary_key, "left_outer")
+    
+    # Check for conflicts
+    columns_to_check = [c for c in new_data.columns if c != primary_key]
+    conflict_conditions = [
+        when(
+            expr(f"""
+            array_contains(current.system_columns, '{c}') AND
+            (
+                (new.{c} IS NULL AND current.{c} IS NOT NULL) OR
+                (new.{c} IS NOT NULL AND current.{c} IS NULL) OR
+                (new.{c} IS NOT NULL AND current.{c} IS NOT NULL AND new.{c} != current.{c})
+            )
+            """),
+            concat_ws(": ", 
+                lit(f"Conflict in {c}"),
+                concat_ws(" -> ", coalesce(col(f"current.{c}"), lit("NULL")), coalesce(col(f"new.{c}"), lit("NULL")))
+            )
+        ).otherwise(lit(None)).alias(f"conflict_{c}")
+        for c in columns_to_check
+    ]
+    
+    conflicts = joined_df.select(
+        col(f"new.{primary_key}"),
+        *conflict_conditions,
+        "current.system_columns"
+    ).where(expr(" OR ".join([f"conflict_{c} IS NOT NULL" for c in columns_to_check])))
+    
+    conflict_count = conflicts.count()
+    print(f"Conflicts found: {conflict_count}")
+    
+    if conflict_count > 0:
+        print("Conflict details:")
+        conflicts.show(truncate=False)
+        
+        error_message = "Conflicts detected: User attempting to update system-modified cells\n"
+        for row in conflicts.collect():
+            error_message += f"\nConflict for {primary_key}: {row[primary_key]}\n"
+            error_message += f"System columns: {row['system_columns']}\n"
+            for c in columns_to_check:
+                conflict_col = f"conflict_{c}"
+                if row[conflict_col] is not None:
+                    error_message += f"  {row[conflict_col]}\n"
+        raise ValueError(error_message)
+    
+    # Prepare update set clause
+    update_set = {c: f"newData.{c}" for c in new_data.columns if c != primary_key}
+    
+    # Prepare update condition
+    update_condition = " OR ".join([
+        f"""
+        (
+            (newData.{c} IS NULL AND oldData.{c} IS NOT NULL) OR
+            (newData.{c} IS NOT NULL AND oldData.{c} IS NULL) OR
+            (newData.{c} IS NOT NULL AND oldData.{c} IS NOT NULL AND newData.{c} != oldData.{c})
+        )
+        """
+        for c in columns_to_check
+    ])
+    
+    print("Executing merge operation")
+    # Perform merge
+    (delta_table.alias("oldData")
+     .merge(
+        new_data.alias("newData"),
+        f"oldData.{primary_key} = newData.{primary_key}"
+     )
+     .whenMatchedUpdate(
+        condition = update_condition,
+        set = update_set
+     )
+     .whenNotMatchedInsert(
+        values = {c: f"newData.{c}" for c in new_data.columns}
+     )
+     .execute()
+    )
+    
+    print("User upsert completed successfully")
+
 # Run the test
 run_test()
