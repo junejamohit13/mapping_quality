@@ -35,7 +35,23 @@ def compute_hash(row: Row, cols: List[str]) -> str:
 from pyspark.sql.functions import col, array_union, array, lit, when, struct
 from pyspark.sql.types import StringType
 from delta.tables import DeltaTable
-
+def get_cast_expression(field):
+    if isinstance(field.dataType, DecimalType):
+        return expr(f"cast(`{field.name}` as decimal({field.dataType.precision},{field.dataType.scale}))")
+    elif isinstance(field.dataType, IntegerType):
+        return col(field.name).cast("integer")
+    elif isinstance(field.dataType, DoubleType):
+        return col(field.name).cast("double")
+    elif isinstance(field.dataType, DateType):
+        return to_date(col(field.name))
+    elif isinstance(field.dataType, TimestampType):
+        return to_timestamp(col(field.name))
+    elif isinstance(field.dataType, BooleanType):
+        return when(col(field.name).isin(['true', 'True', 'TRUE', '1', 't', 'y', 'yes', 'Y'], True)
+                    .otherwise(when(col(field.name).isin(['false', 'False', 'FALSE', '0', 'f', 'n', 'no', 'N'], False)
+                    .otherwise(None))))
+    else:
+        return col(field.name)  # Keep as string for other types
 @udf(returnType=StringType())
 def compute_hash(*cols):
     return hashlib.md5("".join(str(v) for v in cols if v is not None).encode()).hexdigest()
