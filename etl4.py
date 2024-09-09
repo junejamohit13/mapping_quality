@@ -100,8 +100,9 @@ def system_upsert(table_name, new_data):
 from pyspark.sql.functions import coalesce, col, lit, when
 
 from pyspark.sql.functions import coalesce, col
+from pyspark.sql.functions import coalesce, col, lit, when, array
 
-def user_upsert(table_name, new_data):
+def user_upsert(table_name, new_data, primary_key='id'):
     delta_table = DeltaTable.forName(spark, table_name)
     current_data = delta_table.toDF()
     
@@ -109,12 +110,20 @@ def user_upsert(table_name, new_data):
     print(f"New data count: {new_data.count()}")
     
     # Join new data with current data
-    joined_df = new_data.alias("new").join(current_data.alias("current"), "id", "left_outer")
+    joined_df = new_data.alias("new").join(current_data.alias("current"), primary_key, "left_outer")
     
     # Check for conflicts
+    columns_to_check = [c for c in new_data.columns if c != primary_key]
     conflict_condition = " OR ".join([
-        f"(array_contains(current.system_columns, '{c}') AND (coalesce(new.{c}, '') != coalesce(current.{c}, '')))"
-        for c in new_data.columns if c != "id"
+        f"""
+        array_contains(current.system_columns, '{c}') AND
+        (
+            (new.{c} IS NULL AND current.{c} IS NOT NULL) OR
+            (new.{c} IS NOT NULL AND current.{c} IS NULL) OR
+            (new.{c} IS NOT NULL AND current.{c} IS NOT NULL AND new.{c} != current.{c})
+        )
+        """
+        for c in columns_to_check
     ])
     
     conflicts = joined_df.filter(conflict_condition)
@@ -124,20 +133,30 @@ def user_upsert(table_name, new_data):
     if conflict_count > 0:
         error_message = "Conflicts detected: User attempting to update system-modified cells\n"
         for row in conflicts.collect():
-            error_message += f"\nConflict for ID: {row['new.id']}\n"
+            error_message += f"\nConflict for {primary_key}: {row[f'new.{primary_key}']}\n"
             error_message += f"System columns: {row['current.system_columns']}\n"
-            for c in new_data.columns:
-                if c != "id" and c in row["current.system_columns"] and (row[f"new.{c}"] != row[f"current.{c}"] or (row[f"new.{c}"] is None) != (row[f"current.{c}"] is None)):
+            for c in columns_to_check:
+                if c in row["current.system_columns"] and (
+                    (row[f"new.{c}"] is None and row[f"current.{c}"] is not None) or
+                    (row[f"new.{c}"] is not None and row[f"current.{c}"] is None) or
+                    (row[f"new.{c}"] is not None and row[f"current.{c}"] is not None and row[f"new.{c}"] != row[f"current.{c}"])
+                ):
                     error_message += f"  Column '{c}': current value = '{row[f'current.{c}']}', new value = '{row[f'new.{c}']}'\n"
         raise ValueError(error_message)
     
     # Prepare update set clause
-    update_set = {c: f"newData.{c}" for c in new_data.columns if c != "id"}
+    update_set = {c: f"newData.{c}" for c in new_data.columns if c != primary_key}
     
     # Prepare update condition
     update_condition = " OR ".join([
-        f"(coalesce(newData.{c}, '') != coalesce(oldData.{c}, ''))"
-        for c in new_data.columns if c != "id"
+        f"""
+        (
+            (newData.{c} IS NULL AND oldData.{c} IS NOT NULL) OR
+            (newData.{c} IS NOT NULL AND oldData.{c} IS NULL) OR
+            (newData.{c} IS NOT NULL AND oldData.{c} IS NOT NULL AND newData.{c} != oldData.{c})
+        )
+        """
+        for c in columns_to_check
     ])
     
     print("Executing merge operation")
@@ -145,7 +164,7 @@ def user_upsert(table_name, new_data):
     (delta_table.alias("oldData")
      .merge(
         new_data.alias("newData"),
-        "oldData.id = newData.id"
+        f"oldData.{primary_key} = newData.{primary_key}"
      )
      .whenMatchedUpdate(
         condition = update_condition,
